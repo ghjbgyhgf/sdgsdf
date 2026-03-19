@@ -975,7 +975,11 @@ function startWelcomeBot() {
 
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
-      `/reject_suspicious — رفض وحظر جميع المشبوهين\n`
+      `/reject_suspicious — رفض وحظر جميع المشبوهين\n\n` +
+
+      `⏳ <b>إدارة الحد اليومي</b>\n` +
+      `/awaiting_queue — عرض السحوبات المعلقة بسبب الحد اليومي + إجمالي التون\n` +
+      `/unlock [عدد] — تحرير عدد محدد من الطلبات للدفع (مثال: /unlock 100)\n`
     );
   });
 
@@ -1612,6 +1616,117 @@ function startWelcomeBot() {
         await adminReply(bot, msg.chat.id, text);
         if (i + CHUNK < held.length) await new Promise(r => setTimeout(r, 500));
       }
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /awaiting_queue ──────────────────────────────────
+  // يعرض السحوبات المعلقة بسبب الحد اليومي مع إجمالي التون
+  bot.onText(/\/awaiting_queue/, async (msg) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+
+      if (!items) {
+        await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي");
+        return;
+      }
+
+      const list = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const totalTON = list.reduce((s, w) => s + roundAmount(w.ton), 0);
+
+      const CHUNK = 15;
+      for (let i = 0; i < list.length; i += CHUNK) {
+        const chunk = list.slice(i, i + CHUNK);
+        let text = i === 0
+          ? `⏳ <b>سحوبات انتظار الحد اليومي</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📦 الإجمالي: <b>${list.length}</b> طلب\n` +
+            `💰 إجمالي التون: <b>${totalTON.toFixed(4)} TON</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n\n`
+          : `⏳ <b>تابع... (${i + 1}–${Math.min(i + CHUNK, list.length)})</b>\n\n`;
+
+        chunk.forEach((w, idx) => {
+          const ton  = roundAmount(w.ton);
+          const time = w.ts ? new Date(w.ts).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
+          text +=
+            `${i + idx + 1}. 👤 <code>${w.userId || '?'}</code>\n` +
+            `   🆔 <code>${w.id}</code>\n` +
+            `   💰 <b>${ton} TON</b> | 🪙 ${Number(w.amt || 0).toLocaleString()}\n` +
+            `   📬 <code>${String(w.address || '').substring(0, 20)}...</code>\n` +
+            `   🕐 ${time} UTC\n\n`;
+        });
+
+        if (i === 0) {
+          text += `\n💡 لفك انتظار عدد منها:\n<code>/unlock [عدد]</code>\nمثال: <code>/unlock 100</code>`;
+        }
+
+        await adminReply(bot, msg.chat.id, text);
+        if (i + CHUNK < list.length) await new Promise(r => setTimeout(r, 500));
+      }
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /unlock [عدد] ────────────────────────────────────
+  // يحول عدد معين من awaiting_approval → pending (الأقدم أولاً)
+  bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+
+    const requestedCount = match[1] ? parseInt(match[1]) : null;
+    if (!requestedCount || requestedCount < 1) {
+      await adminReply(bot, msg.chat.id,
+        `❌ يجب تحديد عدد صحيح\n\nمثال: <code>/unlock 100</code>\nأو: <code>/unlock 50</code>`
+      );
+      return;
+    }
+
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+
+      if (!items) {
+        await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي");
+        return;
+      }
+
+      // رتب الأقدم أولاً وخد العدد المطلوب
+      const sorted = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const toUnlock = sorted.slice(0, requestedCount);
+      const totalTON = toUnlock.reduce((s, w) => s + roundAmount(w.ton), 0);
+
+      // حدّث كلهم دفعة واحدة
+      const updates = {};
+      const now = Date.now();
+      toUnlock.forEach(w => {
+        updates[`${w.id}/status`]          = "pending";
+        updates[`${w.id}/approvedByAdmin`] = true;
+        updates[`${w.id}/updatedAt`]       = now;
+        updates[`${w.id}/holdReason`]      = null;
+        updates[`${w.id}/unlockedAt`]      = now;
+      });
+      await db.ref("withdrawQueue").update(updates);
+
+      const remaining = sorted.length - toUnlock.length;
+
+      await adminReply(bot, msg.chat.id,
+        `✅ <b>تم فك الانتظار</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `🔓 تم تحرير: <b>${toUnlock.length}</b> طلب\n` +
+        `💰 إجمالي التون: <b>${totalTON.toFixed(4)} TON</b>\n` +
+        `⏳ متبقي في الانتظار: <b>${remaining}</b> طلب\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n\n` +
+        `🚀 جاري إرسالها للمعالجة الآن...`
+      );
+
+      console.log(`🔓 Admin unlocked ${toUnlock.length} awaiting_approval → pending | ${totalTON.toFixed(4)} TON`);
+      setTimeout(() => processPendingWithdrawals(), 1000);
+
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
